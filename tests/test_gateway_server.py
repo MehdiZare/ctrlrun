@@ -28,7 +28,7 @@ from ctrlrun.gateway.server import (
     build_server,
     httpx_forwarder,
 )
-from ctrlrun.receipt import ReceiptResult
+from ctrlrun.receipt import ReceiptResult, verify_chain
 
 httpx = pytest.importorskip("httpx", reason="the gateway extra is not installed")
 
@@ -764,6 +764,115 @@ def test_T25_a_denied_request_is_not_re_asked_until_it_expires(client, upstream,
     assert _error(second)["code"] == -41003
     assert len(store.approvals_for(store.get_approval(request_id).action_hash)) == 1
     assert upstream.calls == []
+
+
+def test_T25_a_refusal_before_asking_for_a_committed_effect_writes_a_blocked_receipt(
+    client, upstream, store
+):
+    """§6.10 — the `-41004` pre-check is a decision, and it leaves a receipt.
+
+    Approve, grant, commit, then the identical call a third time. The third call is refused
+    before `Control.execute`. The store holds the committed receipt and a blocked one. Before
+    the fix it held the committed receipt only, and nine events.
+    """
+    upstream.respond({"resultType": "complete", "content": []})
+    body = _needs_approval()
+    first = client.post("/mcp", content=json.dumps(body).encode(), headers=_headers(body))
+    store.grant_approval(_error(first)["data"]["request_id"], "cli:local")
+    client.post("/mcp", content=json.dumps(body).encode(), headers=_headers(body))
+
+    third = client.post("/mcp", content=json.dumps(body).encode(), headers=_headers(body))
+
+    assert third.status_code == 409, third.text
+    assert _error(third)["code"] == -41004, third.text
+    receipts = store.receipts()
+    assert len(receipts) == 2, [receipt.result for receipt in receipts]
+    blocked = receipts[-1]
+    assert blocked.result is ReceiptResult.BLOCKED
+    assert blocked.effect_key == "refund:txn_2"
+    assert blocked.decision_reason == "rule[1]"
+    tail = store.events()[-3:]
+    assert [event.type.value for event in tail] == [
+        "ACTION_PROPOSED",
+        "POLICY_EVALUATED",
+        "EFFECT_RESERVATION_REFUSED",
+    ]
+    assert dict(tail[-1].data) == {"reason": "duplicate", "state": "committed"}
+    assert len(upstream.calls) == 1
+    assert verify_chain(store).ok, verify_chain(store)
+
+
+def test_T25_a_refusal_before_asking_for_an_ambiguous_effect_writes_a_blocked_receipt(
+    client, upstream, store
+):
+    """§6.10 — the same pre-check, on an effect whose outcome is unknown.
+
+    Approve, grant, then the executing call loses the upstream's response (`-41010`). The
+    third call is `-41005` and writes a blocked receipt whose refusal reason is `ambiguous`.
+    The upstream was called once. A success on the third call would mean the pre-check let
+    a retry of an unknown outcome through.
+    """
+    body = _needs_approval()
+    first = client.post("/mcp", content=json.dumps(body).encode(), headers=_headers(body))
+    store.grant_approval(_error(first)["data"]["request_id"], "cli:local")
+    upstream.drop_after_request = True
+    lost = client.post("/mcp", content=json.dumps(body).encode(), headers=_headers(body))
+    assert _error(lost)["code"] == -41010, lost.text
+    upstream.drop_after_request = False
+    upstream.respond({"resultType": "complete", "content": []})
+
+    third = client.post("/mcp", content=json.dumps(body).encode(), headers=_headers(body))
+
+    assert third.status_code == 409, third.text
+    assert _error(third)["code"] == -41005, third.text
+    receipts = store.receipts()
+    assert len(receipts) == 2, [receipt.result for receipt in receipts]
+    blocked = receipts[-1]
+    assert blocked.result is ReceiptResult.BLOCKED
+    assert blocked.effect_key == "refund:txn_2"
+    assert blocked.decision_reason == "rule[1]"
+    tail = store.events()[-3:]
+    assert [event.type.value for event in tail] == [
+        "ACTION_PROPOSED",
+        "POLICY_EVALUATED",
+        "EFFECT_RESERVATION_REFUSED",
+    ]
+    assert dict(tail[-1].data) == {"reason": "ambiguous"}
+    assert len(upstream.calls) == 1
+    assert verify_chain(store).ok, verify_chain(store)
+
+
+def test_T25_a_resent_denied_call_writes_a_denied_receipt_and_asks_no_one(client, upstream, store):
+    """§6.10 — a resend after a deny is a decision too, and it asks nobody again.
+
+    The receipt is `denied`, not `blocked`: a human said no, which is a different answer
+    from a reservation refusing a retry. The events end with `ACTION_DENIED` carrying
+    `approval_denied` and the request that held the denial.
+    """
+    body = _needs_approval()
+    first = client.post("/mcp", content=json.dumps(body).encode(), headers=_headers(body))
+    request_id = _error(first)["data"]["request_id"]
+    store.deny_approval(request_id, "cli:local")
+
+    second = client.post("/mcp", content=json.dumps(body).encode(), headers=_headers(body))
+
+    assert second.status_code == 403, second.text
+    assert _error(second)["code"] == -41003, second.text
+    receipts = store.receipts()
+    assert len(receipts) == 1, [receipt.result for receipt in receipts]
+    assert receipts[-1].result is ReceiptResult.DENIED
+    assert receipts[-1].effect_key == "refund:txn_2"
+    assert receipts[-1].decision_reason == "rule[1]"
+    tail = store.events()[-3:]
+    assert [event.type.value for event in tail] == [
+        "ACTION_PROPOSED",
+        "POLICY_EVALUATED",
+        "ACTION_DENIED",
+    ]
+    assert dict(tail[-1].data) == {"reason": "approval_denied", "request_id": request_id}
+    assert len(store.approvals_for(store.get_approval(request_id).action_hash)) == 1
+    assert upstream.calls == []
+    assert verify_chain(store).ok, verify_chain(store)
 
 
 # --- §6.3: everything else is relayed --------------------------------------------------

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Final, Protocol, TypeAlias
 
 from ..action import Action, Principal
+from ..approval import APPROVAL_DENIED as APPROVAL_DENIED_REASON
 from ..control import Control
 from ..effect import EffectState, resolve_effect_key, resolve_resource
 from ..errors import (
@@ -50,8 +51,8 @@ from ..identity import (
     IdentityProvider,
     StaticIdentityProvider,
 )
-from ..policy import OBSERVE, UPSTREAM_MISMATCH, UPSTREAM_UNVERIFIED, Policy
-from ..receipt import Receipt
+from ..policy import OBSERVE, UPSTREAM_MISMATCH, UPSTREAM_UNVERIFIED, Evaluation, Policy
+from ..receipt import EventType, Receipt, ReceiptResult
 from .mcp import (
     ACCEPTED_REVISIONS,
     DEFAULT_MAX_BODY_BYTES,
@@ -781,9 +782,8 @@ class Gateway:
         # it at all: without that a hop-selected grant is decided one way for the approval
         # pre-check and another for the call, and a human is asked about an action the hop admits
         # or not asked about one it refuses.
-        if self._control.evaluate(action, task=parsed.task, hop=parsed.hop).decision.value == (
-            "approve"
-        ):
+        evaluation = self._control.evaluate(action, task=parsed.task, hop=parsed.hop)
+        if evaluation.decision.value == "approve":
             approval = self._control.store.find_granted_approval(action.action_hash)
             if approval is None and self._control.policy.mode != OBSERVE:
                 # SPEC-v0.3 §6.2 — §6.10's pre-check exists to spare a human, and it spares
@@ -792,7 +792,7 @@ class Gateway:
                 # §9's ⚠ rows in the one mode that enforces none of them, and an operator
                 # measuring what enforcement would cost would be reading a number the
                 # gateway had already changed.
-                refusal = self._before_asking_a_human(action, effect_key, request_id)
+                refusal = self._before_asking_a_human(action, effect_key, request_id, evaluation)
                 if refusal is not None:
                     return refusal
         try:
@@ -918,7 +918,11 @@ class Gateway:
         return self._upstream_response(action, held, effect_key, receipt)
 
     def _before_asking_a_human(
-        self, action: Action, effect_key: str | None, request_id: JsonRpcId
+        self,
+        action: Action,
+        effect_key: str | None,
+        request_id: JsonRpcId,
+        evaluation: Evaluation,
     ) -> _Response | None:
         """Two reasons not to create another approval request (SPEC-v0.2 §6.10).
 
@@ -931,9 +935,17 @@ class Gateway:
         wears the same approver down for the same reason, and the answer could not be acted
         on if they said yes. So the refusal the reservation would give is given now, before
         anyone is troubled by it. It only ever refuses more.
+
+        A pre-check refusal is a decision, and it is recorded the way `Control.execute`
+        records the same one: `ACTION_PROPOSED`, `POLICY_EVALUATED`, then `ACTION_DENIED`
+        and a `denied` receipt, or `EFFECT_RESERVATION_REFUSED` and a `blocked` receipt.
+        The wire response is the one this returned before the record existed. Nothing here
+        catches a store error: a decision that was not recorded is not one this may report,
+        same as `_record_unrepresentable`.
         """
         denied = self._control.store.find_denied_request(action.action_hash)
         if denied is not None:
+            self._record_denied_before_asking(action, evaluation, effect_key, denied.request_id)
             code, token, status = APPROVAL_DENIED
             return _json(
                 status,
@@ -952,6 +964,15 @@ class Gateway:
         if record is None:
             return None
         if record.state is EffectState.COMMITTED:
+            message = f"effect {effect_key!r} was already committed by {record.action_id}"
+            self._proposed_and_evaluated(action, evaluation, effect_key)
+            self._control._refused(
+                action,
+                evaluation,
+                self._control._clock(),
+                effect_key,
+                DuplicateEffect(message, state="committed", effect_key=effect_key),
+            )
             code, token, status = DUPLICATE_EFFECT
             return _json(
                 status,
@@ -959,12 +980,21 @@ class Gateway:
                     request_id,
                     code,
                     token,
-                    f"effect {effect_key!r} was already committed by {record.action_id}",
+                    message,
                     effect_key=effect_key,
                     state="committed",
                 ),
             )
         if record.state is EffectState.AMBIGUOUS:
+            message = f"effect {effect_key!r} has an unknown outcome from {record.action_id}"
+            self._proposed_and_evaluated(action, evaluation, effect_key)
+            self._control._refused(
+                action,
+                evaluation,
+                self._control._clock(),
+                effect_key,
+                AmbiguousEffect(message, effect_key=effect_key, action_id=record.action_id),
+            )
             code, token, status = AMBIGUOUS_EFFECT
             return _json(
                 status,
@@ -972,11 +1002,47 @@ class Gateway:
                     request_id,
                     code,
                     token,
-                    f"effect {effect_key!r} has an unknown outcome from {record.action_id}",
+                    message,
                     effect_key=effect_key,
                 ),
             )
         return None
+
+    def _proposed_and_evaluated(
+        self, action: Action, evaluation: Evaluation, effect_key: str | None
+    ) -> None:
+        """The two events `Control.execute` writes before any refusal of its own."""
+        control = self._control
+        control._append(
+            EventType.ACTION_PROPOSED, action, {"action_hash": action.action_hash}, effect_key
+        )
+        control._append(
+            EventType.POLICY_EVALUATED,
+            action,
+            {"decision": str(evaluation.decision), "reason": evaluation.reason},
+            effect_key,
+        )
+
+    def _record_denied_before_asking(
+        self, action: Action, evaluation: Evaluation, effect_key: str | None, request_id: str
+    ) -> None:
+        """SPEC-v0.2 §6.10 — the `-41003` pre-check refusal, recorded."""
+        control = self._control
+        self._proposed_and_evaluated(action, evaluation, effect_key)
+        control._append(
+            EventType.ACTION_DENIED,
+            action,
+            {"reason": APPROVAL_DENIED_REASON, "request_id": request_id},
+            effect_key,
+        )
+        control._record(
+            action,
+            evaluation,
+            ReceiptResult.DENIED,
+            control._clock(),
+            error=f"a human already refused this exact action in {request_id}",
+            effect_key=effect_key,
+        )
 
     def _over_the_round_bound(
         self, action: Action, effect_key: str | None, request_id: JsonRpcId

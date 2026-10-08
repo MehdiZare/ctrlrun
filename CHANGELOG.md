@@ -34,6 +34,17 @@ any change to one appears here.
   --stdio` with `CTRLRUN_CONFIG` pointing at your policy, which is a config block a desktop
   client can install.
 
+### Fixed
+
+- **A gateway pre-check refusal now leaves a receipt.** `_before_asking_a_human` answered
+  `-41003`, `-41004` and `-41005` before `Control.execute` and wrote nothing, so a third
+  identical call on an effect that had already committed, a retry of one whose outcome was
+  unknown, or a resend of a call a human had denied, reached a decision the store could not
+  show. The refusal is recorded the way the kernel records the same one: `ACTION_PROPOSED`,
+  `POLICY_EVALUATED`, then a `blocked` receipt for a duplicate or an ambiguous retry and a
+  `denied` receipt for a human's no. The codes the client sees are unchanged, and observe mode
+  is untouched. `SPEC-v0.2` §6.10 and T25 say so.
+
 ## [0.12.2] — the operator's tool descriptions, and the marker the registry reads
 
 A patch release with no change to the enforcement path. Two things sat on `main` with no way for
