@@ -1000,6 +1000,16 @@ of service so much as a way to wear an approver down until one of them clicks th
 button. A denial holds for the life of the request that carried it; after it expires, asking
 again is legitimate.
 
+A pre-check refusal is a decision, and it is recorded. Both refusals above reach one before
+`Control.execute`: `-41003`, where a denial still holds, and `-41004` or `-41005`, where the
+effect key would refuse the action anyway. Each writes `ACTION_PROPOSED` and `POLICY_EVALUATED`,
+then the same record the kernel writes when the call reaches it. A human's no is `ACTION_DENIED`
+and a `denied` receipt. A duplicate or an ambiguous retry is `EFFECT_RESERVATION_REFUSED` and a
+`blocked` receipt. Those are different answers: T23 already writes `blocked` for an identical
+`-41005` on an allow-path call, and `ReceiptResult` defines `blocked` as covering duplicate and
+ambiguous-retry refusals, so a `blocked` receipt is not a human saying no and a `denied` one is
+not a reservation refusing a retry. The wire response is unchanged.
+
 `ctrlrun approve` and `ctrlrun deny` work on gateway requests unchanged: same store.
 
 ### 6.11 What the gateway refuses, in one list
@@ -1280,9 +1290,9 @@ own response reaches the client unchanged apart from `_meta["com.ctrlrun/receipt
 A tool whose policy says `approve`. The first call returns `-41002` with a `request_id` and
 writes no receipt. `ctrlrun approve <id>` runs against the same store. The identical call then
 executes, consumes that approval, and commits. A third identical call returns `-41006`
-(`consumed`) or `-41004`, and the upstream is called exactly once. Separately: after
-`ctrlrun deny <id>`, resending the identical call returns `-41003` and creates **no** second
-approval request, until the denied one expires.
+(`consumed`) or `-41004`, writes a `blocked` receipt, and the upstream is called exactly once.
+Separately: after `ctrlrun deny <id>`, resending the identical call returns `-41003`, writes
+one `denied` receipt and creates **no** second approval request, until the denied one expires.
 
 ### T26 — A held reservation across an elicitation
 With `requestState`: an `input_required` result leaves the effect `EXECUTING` with an extended
